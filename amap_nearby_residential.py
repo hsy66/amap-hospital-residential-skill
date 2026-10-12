@@ -62,26 +62,88 @@ def base_name(n):
     s = re.sub(r"(小区|社区|家属院|家属区|宿舍|公寓|花园|花苑|新村|新城|住宅区)$", "", s) or s
     return s
 
-args_max_pages = 20
+args_max_pages = 8
+WORKERS = 3
+CALLS = 0
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".amap_cache.json")
+SECTORS = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
 
 def similar(b, used):
     """前缀包含视为同一小区系列，例如 湖北邮电 / 湖北邮电新华街…"""
     return any(b == u or (min(len(b), len(u)) >= 3 and (b.startswith(u) or u.startswith(b))) for u in used)
 
-def nearby(center, radius):
-    out, page = {}, 1
+def offset(c, dx, dy):
+    """c 为 (lng,lat)，dx/dy 为米"""
+    return (c[0] + dx / (111320 * math.cos(math.radians(c[1]))), c[1] + dy / 110540)
+
+def bearing(a, b):
+    y = math.sin(math.radians(b[0] - a[0])) * math.cos(math.radians(b[1]))
+    x = math.cos(math.radians(a[1])) * math.sin(math.radians(b[1])) - math.sin(math.radians(a[1])) * math.cos(math.radians(b[1])) * math.cos(math.radians(b[0] - a[0]))
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+def around_all(center, r):
+    global CALLS
+    t0 = time.time()
+    res, page = [], 1
     while True:
-        d = get("around", location=f"{center[0]:.6f},{center[1]:.6f}", radius=radius,
-                types="120300|120302", page_size=25, page_num=page, sortrule="distance")
+        CALLS += 1
+        d = get("around", location=f"{center[0]:.6f},{center[1]:.6f}", radius=r,
+                types="120300|120302", page_size=25, page_num=page)
         pois = d.get("pois") or []
-        for p in pois:
-            if not str(p.get("typecode", "")).startswith("1203"): continue
-            if BAD.search(re.sub(r"[（(].*?[)）]", "", p["name"])): continue
-            dist = haversine(center, loc(p["location"]))
-            if dist <= radius: out[p["id"]] = dict(p, dist=round(dist))
+        res += pois
         if len(pois) < 25 or page >= args_max_pages: break
         page += 1
-    return sorted(out.values(), key=lambda p: p["dist"])
+    return res
+
+def nearby(center, radius, sub_r=900, use_cache=True):
+    """用六边形网格的小半径周边搜索铺满整个圆盘，按 id 去重。"""
+    key = f"{center[0]:.5f},{center[1]:.5f},{radius}"
+    cache = {}
+    if use_cache and os.path.exists(CACHE_FILE):
+        cache = json.load(open(CACHE_FILE, encoding="utf-8"))
+    if key in cache:
+        raw = cache[key]
+    else:
+        step = sub_r * 1.5  # 覆盖六边形网格: 间距 √3·r 足够，取 1.5r 留重叠
+        raw, n, pts = {}, int(radius / step) + 2, []
+        for i in range(-n, n + 1):
+            for j in range(-n, n + 1):
+                dx, dy = (i + (j % 2) * 0.5) * step, j * step * 0.866
+                if math.hypot(dx, dy) <= radius + sub_r * 0.5: pts.append(offset(center, dx, dy))
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(WORKERS) as ex:
+            for lst in ex.map(lambda c: around_all(c, sub_r), pts):
+                for p in lst: raw[p["id"]] = p
+        raw = list(raw.values())
+        if use_cache:
+            cache[key] = raw
+            json.dump(cache, open(CACHE_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+    out = []
+    for p in raw:
+        if not str(p.get("typecode", "")).startswith("1203"): continue
+        if BAD.search(re.sub(r"[（(].*?[)）]", "", p["name"])) or re.search(r"建设中|在建|待售|拆迁", p["name"]): continue
+        pl = loc(p["location"]); dist = haversine(center, pl)
+        if dist <= radius:
+            out.append(dict(p, dist=round(dist), sector=SECTORS[int(((bearing(center, pl) + 22.5) % 360) // 45)]))
+    return sorted(out, key=lambda p: p["dist"])
+
+def spread_order(cands, radius):
+    """按 距离环(1km) × 8方位 分桶，轮询取，保证远近和方向都分散。"""
+    rings = max(1, math.ceil(radius / 1000))
+    buckets = {}
+    for p in cands:
+        buckets.setdefault((min(p["dist"] // 1000, rings - 1), p["sector"]), []).append(p)
+    keys, order, i = [(r, s) for s in SECTORS for r in range(rings)], [], 0
+    # 交错顺序: 第 k 个取 ring k%rings, sector 按 3 步跳跃，避免相邻
+    keys = [(k % rings, SECTORS[(k * 3) % 8]) for k in range(rings * 8)]
+    while any(buckets.values()):
+        for k in keys:
+            if buckets.get(k):
+                order.append(buckets[k].pop(random_pick(buckets[k])))
+    return order
+
+def random_pick(lst):
+    return len(lst) // 2  # 桶内取中位距离，确定性
 
 def main():
     load_env()
@@ -91,14 +153,19 @@ def main():
     ap.add_argument("-n", "--per-hospital", type=int, default=10)
     ap.add_argument("-r", "--radius", type=int, default=5000)
     ap.add_argument("--format", choices=["md", "json", "csv"], default="md")
-    ap.add_argument("--max-pages", type=int, default=20, help="每家医院周边搜索最多翻页数(每页25条)")
+    ap.add_argument("--max-pages", type=int, default=8, help="每个子搜索点最多翻页数(每页25条)")
+    ap.add_argument("--min-distance", type=int, default=500)
+    ap.add_argument("--strategy", choices=["spread", "nearest"], default="spread")
+    ap.add_argument("--workers", type=int, default=3, help="并发数，受 key QPS 限制")
+    ap.add_argument("--no-cache", action="store_true")
     a = ap.parse_args()
-    global args_max_pages; args_max_pages = a.max_pages
+    global args_max_pages, WORKERS; args_max_pages = a.max_pages; WORKERS = a.workers
     if not os.environ.get("AMAP_KEY"): raise SystemExit("请设置环境变量 AMAP_KEY（高德 Web服务 key）")
     used, cache, rows = set(), {}, []
     for q in a.hospitals:
         if q not in cache:
-            h = resolve(q, a.city); cache[q] = (h, nearby(h["location"], a.radius))
+            h = resolve(q, a.city); c = [p for p in nearby(h["location"], a.radius, use_cache=not a.no_cache) if p["dist"] >= a.min_distance]
+            cache[q] = (h, spread_order(c, a.radius) if a.strategy == "spread" else c)
         h, cands = cache[q]; got = 0
         for p in cands:
             b = base_name(p["name"])
@@ -107,16 +174,17 @@ def main():
             x, y = loc(p["location"])
             rows.append(dict(hospital_query=q, hospital=h["name"], hospital_address=h["address"],
                 compound=p["name"], address=p.get("address", ""), district=p.get("adname", ""),
-                distance_m=p["dist"], lng=x, lat=y))
+                direction=p["sector"], distance_m=p["dist"], lng=x, lat=y))
             if got >= a.per_hospital: break
         if got < a.per_hospital: print(f"提示: {q} 5km 内仅找到 {got} 个不重复小区", file=sys.stderr)
+    print(f"API 调用次数: {CALLS}", file=sys.stderr)
     if a.format == "json": print(json.dumps(rows, ensure_ascii=False, indent=2))
     elif a.format == "csv":
         w = csv.DictWriter(sys.stdout, fieldnames=list(rows[0]) if rows else ["hospital"]); w.writeheader(); w.writerows(rows)
     else:
-        print("| 查询医院 | 定位医院 | 小区 | 地址 | 区 | 直线距离(m) | 经纬度 |\n|---|---|---|---|---|---|---|")
+        print("| 查询医院 | 定位医院 | 小区 | 地址 | 区 | 方位 | 直线距离(m) | 经纬度 |\n|---|---|---|---|---|---|---|---|")
         for r in rows:
-            print(f"| {r['hospital_query']} | {r['hospital']} | {r['compound']} | {r['address']} | {r['district']} | {r['distance_m']} | {r['lng']},{r['lat']} |")
+            print(f"| {r['hospital_query']} | {r['hospital']} | {r['compound']} | {r['address']} | {r['district']} | {r['direction']} | {r['distance_m']} | {r['lng']},{r['lat']} |")
 
 if __name__ == "__main__":
     main()
