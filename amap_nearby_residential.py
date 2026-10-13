@@ -36,6 +36,8 @@ def loc(s):
     x, y = s.split(","); return float(x), float(y)
 
 def resolve(q, city):
+    global CALLS
+    CALLS += 1
     p = dict(keywords=q, types="090100|090101|090102|0901", page_size=5)
     if city: p.update(region=city, city_limit="true")
     pois = get("text", **p).get("pois") or []
@@ -49,7 +51,7 @@ def resolve(q, city):
     raise SystemExit(f"无法定位医院: {q}")
 
 CN = "零〇一二三四五六七八九十百两"
-BAD = re.compile(r"(停车场|出入口|入口|出口|公司|写字楼|大厦|商铺|商业|酒店|宾馆|学校|幼儿园|小学|中学|医院|诊所|门诊|办公|厂|仓库|物业|社区$|居委会|活动室|服务站|服务中心|党群|村委会|还建楼$|售楼|营销中心|示范区|地块|工地|在建|筹建)")
+BAD = re.compile(r"(停车场|出入口|入口|出口|公司|写字楼|大厦|商铺|商业|酒店|宾馆|学校|幼儿园|小学|中学|医院|诊所|门诊|办公|厂|仓库|物业|大夏|大楼|座$|大道$|路$|街$|[路街道]-|社区$|居委会|活动室|服务站|服务中心|党群|村委会|还建楼$|售楼|营销中心|示范区|地块|工地|在建|筹建)")
 def base_name(n):
     s = re.sub(r"[（(\[【].*?[)）\]】]", "", n).strip()
     s = re.sub(r"[-—·\s]+", "", s)
@@ -127,6 +129,42 @@ def nearby(center, radius, sub_r=900, use_cache=True):
             out.append(dict(p, dist=round(dist), sector=SECTORS[int(((bearing(center, pl) + 22.5) % 360) // 45)]))
     return sorted(out, key=lambda p: p["dist"])
 
+def poi_ok(p, center, radius, min_d):
+    if not str(p.get("typecode", "")).startswith("1203"): return None
+    nm = p["name"]
+    if BAD.search(re.sub(r"[（(].*?[)）]", "", nm)) or re.search(r"建设中|在建|待售|拆迁", nm): return None
+    pl = loc(p["location"]); d = haversine(center, pl)
+    if not (min_d <= d <= radius): return None
+    return dict(p, dist=round(d), sector=SECTORS[int(((bearing(center, pl) + 22.5) % 360) // 45)])
+
+def random_pick_compounds(center, n, radius, min_d, sub_r, used, used_ids, rng, max_attempts):
+    """随机采样：每次随机方位(分层：8个45°扇区轮流，扇区内均匀)+面积均匀的随机距离，
+    在该点做一次小半径周边搜索(1页)，取离随机点最近的合格小区。"""
+    global CALLS
+    out, attempts, sectors = [], 0, []
+    while len(out) < n and attempts < max_attempts:
+        attempts += 1
+        if not sectors:
+            sectors = list(range(8)); rng.shuffle(sectors)
+        sec = sectors[0]
+        brg = (sec * 45 - 22.5 + rng.random() * 45) % 360
+        d = math.sqrt(rng.uniform(min_d ** 2, radius ** 2))  # 面积均匀
+        pt = offset(center, d * math.sin(math.radians(brg)), d * math.cos(math.radians(brg)))
+        CALLS += 1
+        pois = get("around", location=f"{pt[0]:.6f},{pt[1]:.6f}", radius=sub_r,
+                   types="120300|120302", page_size=25, page_num=1, sortrule="distance").get("pois") or []
+        best = None
+        for p in pois:
+            if p["id"] in used_ids: continue
+            q = poi_ok(p, center, radius, min_d)
+            if not q or similar(base_name(q["name"]), used): continue
+            dp = haversine(pt, loc(q["location"]))
+            if best is None or dp < best[0]: best = (dp, q)
+        if best:
+            q = best[1]; used.add(base_name(q["name"])); used_ids.add(q["id"])
+            out.append(q); sectors.pop(0)
+    return out, attempts
+
 def spread_order(cands, radius):
     """按 距离环(1km) × 8方位 分桶，轮询取，保证远近和方向都分散。"""
     rings = max(1, math.ceil(radius / 1000))
@@ -155,28 +193,40 @@ def main():
     ap.add_argument("--format", choices=["md", "json", "csv"], default="md")
     ap.add_argument("--max-pages", type=int, default=8, help="每个子搜索点最多翻页数(每页25条)")
     ap.add_argument("--min-distance", type=int, default=500)
-    ap.add_argument("--strategy", choices=["spread", "nearest"], default="spread")
+    ap.add_argument("--strategy", choices=["random", "grid", "nearest"], default="random", help="random=随机采样(省调用,默认); grid=全网格扫描+分桶轮询; nearest=全网格按距离")
     ap.add_argument("--workers", type=int, default=3, help="并发数，受 key QPS 限制")
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--max-attempts", type=int, default=0, help="每次医院出现最多随机次数，默认 5*N")
+    ap.add_argument("--sub-radius", type=int, default=400, help="随机点周边搜索半径(m)")
     ap.add_argument("--no-cache", action="store_true")
     a = ap.parse_args()
     global args_max_pages, WORKERS; args_max_pages = a.max_pages; WORKERS = a.workers
     if not os.environ.get("AMAP_KEY"): raise SystemExit("请设置环境变量 AMAP_KEY（高德 Web服务 key）")
-    used, cache, rows = set(), {}, []
+    import random
+    rng = random.Random(a.seed)
+    used, used_ids, hcache, cache, rows = set(), set(), {}, {}, []
     for q in a.hospitals:
-        if q not in cache:
-            h = resolve(q, a.city); c = [p for p in nearby(h["location"], a.radius, use_cache=not a.no_cache) if p["dist"] >= a.min_distance]
-            cache[q] = (h, spread_order(c, a.radius) if a.strategy == "spread" else c)
-        h, cands = cache[q]; got = 0
-        for p in cands:
-            b = base_name(p["name"])
-            if similar(b, used): continue
-            used.add(b); got += 1
+        if q not in hcache: hcache[q] = resolve(q, a.city)
+        h = hcache[q]
+        if a.strategy == "random":
+            picks, att = random_pick_compounds(h["location"], a.per_hospital, a.radius, a.min_distance,
+                                               a.sub_radius, used, used_ids, rng, a.max_attempts or 5 * a.per_hospital)
+        else:
+            if q not in cache:
+                c = [p for p in nearby(h["location"], a.radius, use_cache=not a.no_cache) if p["dist"] >= a.min_distance]
+                cache[q] = spread_order(c, a.radius) if a.strategy == "grid" else c
+            picks = []
+            for p in cache[q]:
+                b = base_name(p["name"])
+                if p["id"] in used_ids or similar(b, used): continue
+                used.add(b); used_ids.add(p["id"]); picks.append(p)
+                if len(picks) >= a.per_hospital: break
+        for p in picks:
             x, y = loc(p["location"])
             rows.append(dict(hospital_query=q, hospital=h["name"], hospital_address=h["address"],
                 compound=p["name"], address=p.get("address", ""), district=p.get("adname", ""),
                 direction=p["sector"], distance_m=p["dist"], lng=x, lat=y))
-            if got >= a.per_hospital: break
-        if got < a.per_hospital: print(f"提示: {q} 5km 内仅找到 {got} 个不重复小区", file=sys.stderr)
+        if len(picks) < a.per_hospital: print(f"提示: {q} 只找到 {len(picks)}/{a.per_hospital} 个不重复小区", file=sys.stderr)
     print(f"API 调用次数: {CALLS}", file=sys.stderr)
     if a.format == "json": print(json.dumps(rows, ensure_ascii=False, indent=2))
     elif a.format == "csv":
