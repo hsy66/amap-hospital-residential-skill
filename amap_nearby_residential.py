@@ -1,150 +1,284 @@
 #!/usr/bin/env python3
-"""医院直线 5km 内真实住宅小区（高德 Web 服务 API，仅标准库，快速版）。
-python3 amap_nearby_residential.py 武汉协和医院 武汉协和医院 湖北省人民医院 --city 武汉 -n 10 [--format md|json|csv] [--seed 1]
+"""医院直线 5km 内住宅小区（高德 Web 服务，仅标准库）。
+
+每要一个小区才发一次周边搜索，凑够就停。医院定位走地理编码，不占搜索配额。
+python3 amap_nearby_residential.py 武汉协和医院 武汉协和医院 --city 武汉 -n 1
 """
 import argparse, csv, json, math, os, random, re, sys, time, urllib.parse, urllib.request
-from concurrent.futures import ThreadPoolExecutor
 
-RADIUS, MIN_D, SUB_R, TIMEOUT = 5000, 500, 700, 8
-# 采样点 (距离m, 方位°)：1.5/3/4.5km 三个环 × 4 个方向交错，共 12 个，外加医院本身
-POINTS = [(1500, b) for b in (45, 135, 225, 315)] + [(3000, b) for b in (0, 90, 180, 270)] + \
-         [(4300, b) for b in (45, 135, 225, 315)]
-SECTORS = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
-CALLS = 0
-BAD = re.compile(r"(停车场|出入口|入口|出口|公司|写字楼|大厦|大夏|大楼|座$|商铺|商业|酒店|宾馆|学校|幼儿园|小学|中学|"
-                 r"医院|诊所|办公|厂|仓库|物业|售楼|营销中心|地块|工地|社区$|居委会|活动室|服务站|服务中心|党群|还建楼$|"
-                 r"大道$|路$|街$|[路街道]-|建设中|在建|待售|拆迁)")
+RADIUS, INNER, SEARCH_R, TIMEOUT = 5000, 800, 800, 8
+GEOCODE = "https://restapi.amap.com/v3/geocode/geo"
+AROUND = "https://restapi.amap.com/v5/place/around"
+# 8 个方向；两圈按面积切开（外圈更大），不要按 1 公里切
+BEARINGS = (0, 45, 90, 135, 180, 225, 270, 315)
+RING_EDGE = math.sqrt((INNER * INNER + RADIUS * RADIUS) / 2)  # 约 3580m
+RINGS = ((INNER, RING_EDGE), (RING_EDGE, RADIUS))
+CALLS = {"geocode": 0, "search": 0}
+
+BAD = re.compile(
+    r"(停车场|车库|出入口|公司|写字楼|大厦|大楼|商铺|底商|商业|酒店|宾馆|学校|幼儿园|小学|中学|"
+    r"医院|诊所|办公|厂房|仓库|物业|售楼|营销中心|地块|工地|居委会|活动室|服务站|服务中心|"
+    r"党群|宿舍|公寓|还建|大道|路$|街$|建设中|在建|待售|拆迁)"
+)
+CN = "零〇一二三四五六七八九十百两"
+# 只剥「2期 / 东区 / A座 / 1号楼 / 北门」这种分期尾巴。
+# 不剥光秃秃的数字，否则阳光100 会被收成阳光，再和阳光城撞在一起。
+SUFFIX = re.compile(
+    rf"(([{CN}0-9]+|[A-Za-z]+|[东西南北中])(期|区|苑|座|组团|片区|号院|院|栋|号楼|幢|街坊)"
+    rf"|[{CN}0-9]+(号楼|栋|幢|单元|号院|号)"
+    rf"|[A-Za-z](座|栋|区|幢)"
+    rf"|[东西南北]门)$"
+)
+
 
 def load_env():
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if os.path.exists(p):
-        for line in open(p, encoding="utf-8"):
-            if "=" in line and not line.startswith("#"):
-                k, v = line.strip().split("=", 1); os.environ.setdefault(k, v)
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
-def get(url, **params):
-    global CALLS
+
+def get(url, kind, **params):
     params["key"] = os.environ["AMAP_KEY"]
-    url = url + "?" + urllib.parse.urlencode(params)
-    for i in range(4):
-        CALLS += 1
+    full = url + "?" + urllib.parse.urlencode(params)
+    for attempt in range(3):
+        CALLS[kind] += 1
         try:
-            d = json.load(urllib.request.urlopen(url, timeout=TIMEOUT))
-        except Exception as e:
-            if i == 3: raise SystemExit(f"网络错误: {e}")
+            data = json.load(urllib.request.urlopen(full, timeout=TIMEOUT))
+        except Exception as exc:
+            if attempt == 2:
+                raise SystemExit(f"网络错误: {exc}")
+            time.sleep(0.6)
             continue
-        if d.get("status") == "1": return d
-        if "LIMIT" in d.get("info", "") or "FREQUENT" in d.get("info", ""):
-            time.sleep(0.4 + random.random() * 0.4); continue
-        raise SystemExit(f"高德 API 错误: {d.get('info')} (infocode {d.get('infocode')})")
+        if str(data.get("status")) == "1":
+            return data
+        info = str(data.get("info", ""))
+        # 只有访问过于频繁才退避重试。配额用尽（10003/10044 等）重试也没用
+        if info in ("ACCESS_TOO_FREQUENT", "CQPS_HAS_EXCEEDED_THE_LIMIT",
+                    "CKQPS_HAS_EXCEEDED_THE_LIMIT", "CUQPS_HAS_EXCEEDED_THE_LIMIT"):
+            time.sleep(0.8 + random.random())
+            continue
+        raise SystemExit(f"高德 API 错误: {info} (infocode {data.get('infocode')})")
     return {}
 
-def loc(s):
-    x, y = s.split(","); return float(x), float(y)
+
+def loc(text):
+    lng, lat = text.split(",")
+    return float(lng), float(lat)
+
 
 def haversine(a, b):
-    r = math.radians
-    h = math.sin(r(b[1] - a[1]) / 2) ** 2 + math.cos(r(a[1])) * math.cos(r(b[1])) * math.sin(r(b[0] - a[0]) / 2) ** 2
+    rad = math.radians
+    h = math.sin(rad(b[1] - a[1]) / 2) ** 2 + math.cos(rad(a[1])) * math.cos(rad(b[1])) * math.sin(
+        rad(b[0] - a[0]) / 2
+    ) ** 2
     return 2 * 6371008.8 * math.asin(math.sqrt(h))
 
-def bearing(a, b):
-    dx = (b[0] - a[0]) * math.cos(math.radians(a[1])); dy = b[1] - a[1]
-    return (math.degrees(math.atan2(dx, dy)) + 360) % 360
 
-def offset(c, d, brg):
-    return (c[0] + d * math.sin(math.radians(brg)) / (111320 * math.cos(math.radians(c[1]))),
-            c[1] + d * math.cos(math.radians(brg)) / 110540)
+def offset(center, dist, bearing):
+    lng = center[0] + dist * math.sin(math.radians(bearing)) / (111320 * math.cos(math.radians(center[1])))
+    lat = center[1] + dist * math.cos(math.radians(bearing)) / 110540
+    return lng, lat
 
-def resolve(q, city):
-    p = dict(keywords=q, types="090100|090101|090102|0901", page_size=1)
-    if city: p.update(region=city, city_limit="true")
-    pois = get("https://restapi.amap.com/v5/place/text", **p).get("pois") or []
-    if pois:
-        return dict(name=pois[0]["name"], address=pois[0].get("address", ""), location=loc(pois[0]["location"]))
-    g = get("https://restapi.amap.com/v3/geocode/geo", address=q, **({"city": city} if city else {})).get("geocodes") or []
-    if not g: raise SystemExit(f"无法定位医院: {q}")
-    return dict(name=q, address=g[0].get("formatted_address", ""), location=loc(g[0]["location"]))
 
-CN = "零〇一二三四五六七八九十百两"
-SUFFIX = re.compile(rf"(([{CN}0-9]+|[A-Za-z]+|[东西南北中上下内外新老][东西南北]?)(期|区|苑|座|组团|片区|号院|院|栋|号楼|幢|门|街坊)"
-                    rf"|[{CN}0-9A-Za-z]+(栋|号|号楼|单元)?|[东西南北]门)$")
-def base_name(n):
-    s = re.sub(r"[（(\[【].*?[)）\]】]", "", n)
-    s = re.split(r"[-—]", s)[0]                      # 去掉 "-xxx" 子名
-    s = re.sub(r"[·\s]+", "", s)
+def base_name(name):
+    text = re.sub(r"[（(\[【].*?[)）\]】]", "", name)
+    text = re.split(r"[-—]", text)[0]
+    text = re.sub(r"[·\s]+", "", text)
     prev = None
-    while prev != s and len(s) > 2:
-        prev = s; t = SUFFIX.sub("", s); s = t if len(t) >= 2 else s
-    return re.sub(r"(小区|社区|家属院|家属区|宿舍|公寓|花园|花苑|新村|新城|住宅区)$", "", s) or s
+    while prev != text and len(text) > 2:
+        prev = text
+        stripped = SUFFIX.sub("", text)
+        text = stripped if len(stripped) >= 2 else text
+    text = re.sub(r"(小区|社区|家属院|家属区|花园|花苑|新村|住宅区)$", "", text)
+    return text or name
 
-def similar(b, used):
-    return any(b == u or (min(len(b), len(u)) >= 3 and (b.startswith(u) or u.startswith(b))) for u in used)
 
-def fetch_pool(center, page):
-    """并发对 13 个采样点各取 1 页（每页 25 条）。"""
-    pts = [center] + [offset(center, d, b) for d, b in POINTS]
-    def one(pt):
-        return get("https://restapi.amap.com/v5/place/around", location=f"{pt[0]:.6f},{pt[1]:.6f}",
-                   radius=SUB_R if pt is not center else 1200, types="120302|120300",
-                   page_size=25, page_num=page).get("pois") or []
-    pool = {}
-    with ThreadPoolExecutor(6) as ex:  # 超 QPS 自动退避重试
-        for lst in ex.map(one, pts):
-            for p in lst:
-                if not str(p.get("typecode", "")).startswith("1203"): continue
-                if BAD.search(re.sub(r"[（(].*?[)）]", "", p["name"])): continue
-                pl = loc(p["location"]); d = haversine(center, pl)
-                if MIN_D <= d <= RADIUS:
-                    pool[p["id"]] = dict(p, dist=round(d), sector=SECTORS[int(((bearing(center, pl) + 22.5) % 360) // 45)])
-    return pool
+def same_series(a, b):
+    if a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    # 只把「名字 + 很短的尾巴」当成同一处，避免阳光100 和 阳光城 被误伤
+    return len(short) >= 3 and long.startswith(short) and len(long) - len(short) <= 2
 
-def pick(pool, n, used, used_ids, rng):
-    """按 1km 距离环 × 8 方位分桶，打乱后轮询，每桶随机取。"""
-    buckets = {}
-    for p in pool.values():
-        if p["id"] not in used_ids: buckets.setdefault((p["dist"] // 1000, p["sector"]), []).append(p)
-    for b in buckets.values(): rng.shuffle(b)
-    keys = list(buckets); rng.shuffle(keys); out = []
-    while len(out) < n and any(buckets[k] for k in keys):
-        for k in keys:
-            while buckets[k]:
-                p = buckets[k].pop(); b = base_name(p["name"])
-                if similar(b, used): continue
-                used.add(b); used_ids.add(p["id"]); out.append(p); break
-            if len(out) >= n: break
-    return out
+
+def resolve(query, city):
+    params = {"address": query}
+    if city:
+        params["city"] = city
+    rows = get(GEOCODE, "geocode", **params).get("geocodes") or []
+    if not rows or not rows[0].get("location"):
+        raise SystemExit(f"无法定位医院: {query}")
+    row = rows[0]
+    return dict(name=query, address=row.get("formatted_address", ""), location=loc(row["location"]))
+
+
+def slots(rng):
+    """外圈、内圈轮流，方向打乱。每格可抽两次，第二次换一个点。"""
+    order = []
+    bearings = list(BEARINGS)
+    rng.shuffle(bearings)
+    for bearing in bearings:
+        order.append((1, bearing))
+        order.append((0, bearing))
+    order *= 2
+    return order
+
+
+def sample_center(hospital, ring, bearing, rng):
+    near, far = RINGS[ring]
+    # 按面积均匀：外圈不会被抽空，也不会老抽到这一圈的内侧
+    dist = math.sqrt(rng.random() * (far * far - near * near) + near * near)
+    jitter = rng.uniform(-18, 18)
+    return offset(hospital, dist, (bearing + jitter) % 360)
+
+
+def acceptable(poi, hospital):
+    if not str(poi.get("typecode", "")).startswith(("120302", "120301")):
+        return None
+    name = re.sub(r"[（(].*?[)）]", "", poi.get("name", ""))
+    if not name or BAD.search(name):
+        return None
+    if not poi.get("location"):
+        return None
+    point = loc(poi["location"])
+    dist = haversine(hospital, point)
+    if not INNER <= dist <= RADIUS:
+        return None
+    return point, round(dist)
+
+
+def search_one(center):
+    data = get(
+        AROUND,
+        "search",
+        location=f"{center[0]:.6f},{center[1]:.6f}",
+        radius=SEARCH_R,
+        types="120302|120301",
+        sortrule="distance",
+        page_size=25,
+        page_num=1,
+    )
+    return data.get("pois") or []
+
+
+def take_one(pois, hospital, used_names, used_ids, used_parents):
+    ranked = []
+    for poi in pois:
+        judged = acceptable(poi, hospital)
+        if not judged:
+            continue
+        try:
+            ranked.append((float(poi.get("distance") or 10**9), poi, judged))
+        except ValueError:
+            ranked.append((10**9, poi, judged))
+    for _, poi, (point, dist) in sorted(ranked, key=lambda item: item[0]):
+        if poi.get("id") in used_ids:
+            continue
+        parent = poi.get("parent") or ""
+        if parent and parent in used_parents:
+            continue
+        series = base_name(poi["name"])
+        if any(same_series(series, old) for old in used_names):
+            continue
+        used_ids.add(poi.get("id"))
+        if parent:
+            used_parents.add(parent)
+        used_names.add(series)
+        return poi, point, dist, series
+    return None
+
+
+def collect(hospital, need, state, rng):
+    got = []
+    attempts = 0
+    limit = max(need * 2, need)
+    while len(got) < need and attempts < limit:
+        ring, bearing = state["slots"][state["cursor"] % len(state["slots"])]
+        state["cursor"] += 1
+        attempts += 1
+        pois = search_one(sample_center(hospital, ring, bearing, rng))
+        picked = take_one(pois, hospital, state["names"], state["ids"], state["parents"])
+        if picked:
+            poi, point, dist, _series = picked
+            got.append((poi, point, dist))
+    return got
+
 
 def main():
     load_env()
-    ap = argparse.ArgumentParser()
-    ap.add_argument("hospitals", nargs="+"); ap.add_argument("--city", default="")
-    ap.add_argument("-n", type=int, default=10); ap.add_argument("--format", choices=["md", "json", "csv"], default="md")
-    ap.add_argument("--seed", type=int)
-    a = ap.parse_args()
-    if not os.environ.get("AMAP_KEY"): raise SystemExit("请设置 AMAP_KEY（高德 Web服务 key）")
-    rng, used, used_ids, memo, rows, t0 = random.Random(a.seed), set(), set(), {}, [], time.time()
-    for q in a.hospitals:
-        if q not in memo:
-            h = resolve(q, a.city); memo[q] = [h, fetch_pool(h["location"], 1), 1]
-        h, pool, pg = memo[q]
-        got = pick(pool, a.n, used, used_ids, rng)
-        if len(got) < a.n and pg == 1:              # 不够就每个采样点再取第 2 页，仅一次
-            pool.update(fetch_pool(h["location"], 2)); memo[q][2] = 2
-            got += pick(pool, a.n - len(got), used, used_ids, rng)
-        if len(got) < a.n: print(f"提示: {q} 只找到 {len(got)}/{a.n} 个不重复小区", file=sys.stderr)
-        for p in sorted(got, key=lambda p: p["dist"]):
-            x, y = loc(p["location"])
-            rows.append(dict(hospital_query=q, hospital=h["name"], hospital_address=h["address"], compound=p["name"],
-                             address=p.get("address", ""), district=p.get("adname", ""), direction=p["sector"],
-                             distance_m=p["dist"], lng=x, lat=y))
-    print(f"API 调用 {CALLS} 次，用时 {time.time() - t0:.1f}s", file=sys.stderr)
-    if a.format == "json": print(json.dumps(rows, ensure_ascii=False, indent=2))
-    elif a.format == "csv":
-        w = csv.DictWriter(sys.stdout, fieldnames=list(rows[0]) if rows else ["hospital"]); w.writeheader(); w.writerows(rows)
+    parser = argparse.ArgumentParser(description="医院周边 5km 住宅小区，按需搜索")
+    parser.add_argument("hospitals", nargs="+", help="医院名称或地址；重复一次表示再要一批不同的小区")
+    parser.add_argument("--city", default="", help="城市名，避免同名医院定位错")
+    parser.add_argument("-n", type=int, default=1, help="每一行要几个小区，默认 1")
+    parser.add_argument("--format", choices=["md", "json", "csv"], default="md")
+    parser.add_argument("--seed", type=int)
+    args = parser.parse_args()
+    if args.n < 1:
+        raise SystemExit("-n 至少为 1")
+    if not os.environ.get("AMAP_KEY"):
+        raise SystemExit("请设置 AMAP_KEY（高德 Web 服务 key），或在脚本同目录放 .env")
+
+    rng = random.Random(args.seed)
+    memo, rows = {}, []
+    started = time.time()
+    for query in args.hospitals:
+        if query not in memo:
+            memo[query] = {
+                "hospital": resolve(query, args.city),
+                "slots": slots(rng),
+                "cursor": 0,
+                "names": set(),
+                "ids": set(),
+                "parents": set(),
+            }
+        state = memo[query]
+        hospital = state["hospital"]
+        got = collect(hospital["location"], args.n, state, rng)
+        if len(got) < args.n:
+            print(f"提示: {query} 只找到 {len(got)}/{args.n} 个不重复小区", file=sys.stderr)
+        for poi, point, dist in sorted(got, key=lambda item: item[2]):
+            bearing = (math.degrees(math.atan2(
+                (point[0] - hospital["location"][0]) * math.cos(math.radians(hospital["location"][1])),
+                point[1] - hospital["location"][1],
+            )) + 360) % 360
+            direction = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"][int(((bearing + 22.5) % 360) // 45)]
+            rows.append(dict(
+                hospital_query=query,
+                hospital=hospital["name"],
+                hospital_address=hospital["address"],
+                compound=poi["name"],
+                address=poi.get("address", ""),
+                district=poi.get("adname", ""),
+                direction=direction,
+                distance_m=dist,
+                lng=point[0],
+                lat=point[1],
+            ))
+
+    print(
+        f"地理编码 {CALLS['geocode']} 次（不占搜索配额），周边搜索 {CALLS['search']} 次，用时 {time.time() - started:.1f}s",
+        file=sys.stderr,
+    )
+    if args.format == "json":
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+    elif args.format == "csv":
+        writer = csv.DictWriter(sys.stdout, fieldnames=list(rows[0]) if rows else ["hospital_query"])
+        writer.writeheader()
+        writer.writerows(rows)
     else:
-        print("| 查询医院 | 定位医院 | 小区 | 地址 | 区 | 方位 | 直线距离(m) | 经纬度 |\n|---|---|---|---|---|---|---|---|")
-        for r in rows:
-            print(f"| {r['hospital_query']} | {r['hospital']} | {r['compound']} | {r['address']} | {r['district']} | {r['direction']} | {r['distance_m']} | {r['lng']},{r['lat']} |")
+        print("| 查询医院 | 定位医院 | 小区 | 地址 | 区 | 方位 | 直线距离(m) | 经纬度 |")
+        print("|---|---|---|---|---|---|---|---|")
+        for row in rows:
+            print(
+                f"| {row['hospital_query']} | {row['hospital']} | {row['compound']} | {row['address']} | "
+                f"{row['district']} | {row['direction']} | {row['distance_m']} | {row['lng']:.6f},{row['lat']:.6f} |"
+            )
+
 
 if __name__ == "__main__":
     main()
